@@ -1,8 +1,9 @@
-from typing import List, Optional, Dict
-from multiprocessing import Process, Array, Semaphore
-import threading
 import logging
+from typing import List, Optional, Dict
+import threading
+from threading import Semaphore, Lock
 import numpy as np
+
 
 class RAIDController:
     """
@@ -25,10 +26,14 @@ class RAIDController:
         self.num_sectors = num_sectors
         self.num_disks = num_disks
 
-        self.shared_memory = [Array('b', sector_size * num_sectors) for _ in range(num_disks)]
-        self.semaphores = [Semaphore(1) for _ in range(num_disks)]
-        self.disk_processes: List[Process] = []
-        self.initialize_disks()
+        # Zamiast multiprocessing.Array używamy po prostu listy bajtów lub bytearray.
+        # Każdy "dysk" jest reprezentowany przez tablicę znaków (bajtów).
+        self.shared_memory: List[bytearray] = [
+            bytearray(sector_size * num_sectors) for _ in range(num_disks)
+        ]
+
+        # Każdy dysk ma własną semaforę do ochrony zapisu.
+        self.semaphores: List[Semaphore] = [Semaphore(value=1) for _ in range(num_disks)]
 
         # Słownik mapujący typy RAID na odpowiednie metody
         self.write_strategies: Dict[str, callable] = {
@@ -45,26 +50,6 @@ class RAIDController:
 
         logging.info(f"Initialized {raid_type} controller with {num_disks} disks")
 
-    def initialize_disks(self):
-        """
-        Tworzy procesy dla każdego dysku w macierzy.
-        """
-        for i in range(self.num_disks):
-            process = Process(target=self._disk_worker, args=(i,))
-            process.start()
-            self.disk_processes.append(process)
-
-    def _disk_worker(self, disk_id: int):
-        """
-        Wątek roboczy dla symulowanego dysku, odpowiedzialny za zarządzanie pamięcią dzieloną.
-
-        Args:
-            disk_id: Identyfikator dysku
-        """
-        while True:
-            # Wątek dysku obsługuje tutaj żądania zapisu/odczytu
-            pass  # Placeholder - logika komunikacji/działania zostanie dodana później
-
     def write_data(self, data: bytes, sector_number: int) -> bool:
         """
         Zapisuje dane do macierzy RAID używając odpowiedniej strategii.
@@ -78,7 +63,6 @@ class RAIDController:
         """
         if self.raid_type not in self.write_strategies:
             raise ValueError(f"Unsupported RAID type: {self.raid_type}")
-
         return self.write_strategies[self.raid_type](data, sector_number)
 
     def read_data(self, sector_number: int) -> Optional[bytes]:
@@ -93,23 +77,25 @@ class RAIDController:
         """
         if self.raid_type not in self.read_strategies:
             raise ValueError(f"Unsupported RAID type: {self.raid_type}")
-
         return self.read_strategies[self.raid_type](sector_number)
+
+    # -----------------------
+    # Metody zapisu
+    # -----------------------
 
     def _write_raid0(self, data: bytes, sector_number: int) -> bool:
         """
         Implementacja zapisu dla RAID0 (striping).
         Dane są dzielone równo między wszystkie dyski.
         """
-        stripe_size = len(data) // self.num_disks
         success = True
+        stripe_size = len(data) // self.num_disks if self.num_disks > 0 else len(data)
 
         for i in range(self.num_disks):
             start = i * stripe_size
             end = start + stripe_size
             stripe_data = data[start:end]
 
-            # Blokada zapisu
             self.semaphores[i].acquire()
             try:
                 start_idx = sector_number * self.sector_size
@@ -145,17 +131,26 @@ class RAIDController:
     def _write_raid3(self, data: bytes, sector_number: int) -> bool:
         """
         Implementacja zapisu dla RAID3 (striping z dedykowaną parzystością).
+        Ostatni dysk w tablicy to dysk parzystości.
         """
-        stripe_size = len(data) // (self.num_disks - 1)  # Jeden dysk na parzystość
-        parity = bytearray(stripe_size)
         success = True
+        if self.num_disks < 2:
+            logging.error("RAID3 requires at least 2 disks.")
+            return False
 
-        for i in range(self.num_disks - 1):
+        data_disks = self.num_disks - 1
+        stripe_size = len(data) // data_disks if data_disks > 0 else len(data)
+
+        # Bufor na parzystość
+        parity = bytearray(stripe_size)
+
+        # Zapis + obliczanie parzystości
+        for i in range(data_disks):
             start = i * stripe_size
             end = start + stripe_size
             stripe_data = data[start:end]
 
-            # Obliczanie parzystości
+            # XOR do parzystości
             for j in range(len(stripe_data)):
                 parity[j] ^= stripe_data[j]
 
@@ -169,25 +164,129 @@ class RAIDController:
             finally:
                 self.semaphores[i].release()
 
-        # Zapis parzystości
-        self.semaphores[-1].acquire()
+        # Zapis dysku parzystości (ostatni dysk)
+        parity_disk = self.num_disks - 1
+        self.semaphores[parity_disk].acquire()
         try:
             start_idx = sector_number * self.sector_size
-            self.shared_memory[-1][start_idx:start_idx + len(parity)] = parity
+            self.shared_memory[parity_disk][start_idx:start_idx + len(parity)] = parity
         except Exception as e:
             success = False
             logging.error(f"RAID3 parity write failed: {e}")
         finally:
-            self.semaphores[-1].release()
+            self.semaphores[parity_disk].release()
 
         return success
 
+    # -----------------------
+    # Metody odczytu
+    # -----------------------
+
+    def _read_raid0(self, sector_number: int) -> Optional[bytes]:
+        """
+        Implementacja odczytu dla RAID0.
+        Odczytuje dane z wszystkich dysków i je scala.
+        """
+        success = True
+        result = bytearray()
+
+        for i in range(self.num_disks):
+            self.semaphores[i].acquire()
+            try:
+                start_idx = sector_number * self.sector_size
+                part = self.shared_memory[i][start_idx:start_idx + self.sector_size]
+                result.extend(part)
+            except Exception as e:
+                success = False
+                logging.error(f"RAID0 read failed on disk {i}: {e}")
+            finally:
+                self.semaphores[i].release()
+
+        return bytes(result) if success else None
+
+    def _read_raid1(self, sector_number: int) -> Optional[bytes]:
+        """
+        Implementacja odczytu dla RAID1.
+        Dane są odczytywane z pierwszego dostępnego (nieuszkodzonego) dysku.
+        """
+        for i in range(self.num_disks):
+            self.semaphores[i].acquire()
+            try:
+                start_idx = sector_number * self.sector_size
+                data = bytes(self.shared_memory[i][start_idx:start_idx + self.sector_size])
+                return data
+            except Exception as e:
+                logging.warning(f"RAID1 read failed on disk {i}: {e}")
+            finally:
+                self.semaphores[i].release()
+
+        logging.error("RAID1 read failed: no functional disks")
+        return None
+
+    def _read_raid3(self, sector_number: int) -> Optional[bytes]:
+        """
+        Implementacja odczytu dla RAID3.
+        Odczyt danych z dysków, regeneracja w razie potrzeby.
+        Ostatni dysk jest dyskiem parzystości.
+        """
+        if self.num_disks < 2:
+            logging.error("RAID3 requires at least 2 disks.")
+            return None
+
+        data_disks = self.num_disks - 1
+        stripe_size = self.sector_size
+
+        parity = bytearray(stripe_size)
+        result = bytearray()
+        failed_disk_idx = -1
+
+        # Najpierw wczytujemy dane z dysków „danych”
+        for i in range(data_disks):
+            self.semaphores[i].acquire()
+            try:
+                start_idx = sector_number * stripe_size
+                stripe_data = self.shared_memory[i][start_idx:start_idx + stripe_size]
+                result.extend(stripe_data)
+                # XOR w locie do parzystości
+                for j in range(stripe_size):
+                    parity[j] ^= stripe_data[j]
+            except Exception as e:
+                failed_disk_idx = i
+                logging.warning(f"RAID3 read: disk {i} failed during read: {e}")
+                # Zapisz informację, który dysk padł i spróbujemy zrekonstruować
+            finally:
+                self.semaphores[i].release()
+
+        # Jeśli któryś dysk danych jest uszkodzony, odczytujemy parzystość i rekonstruujemy
+        if failed_disk_idx != -1:
+            parity_disk = self.num_disks - 1
+            self.semaphores[parity_disk].acquire()
+            try:
+                start_idx = sector_number * stripe_size
+                parity_data = self.shared_memory[parity_disk][start_idx:start_idx + stripe_size]
+                # Miejsce w result, gdzie powinna być partia z failed_disk_idx
+                offset = failed_disk_idx * stripe_size
+                # Nadpisz surowe dane w result danymi z parzystości
+                for j in range(stripe_size):
+                    # Startowo przypisz bajt z parzystości
+                    result[offset + j] = parity_data[j]
+                    # XOR z innymi dyskami (oprócz uszkodzonego), żeby odtworzyć oryginał
+                    for k in range(data_disks):
+                        if k != failed_disk_idx:
+                            idx_k = k * stripe_size + j
+                            result[offset + j] ^= result[idx_k]
+            except Exception as e:
+                logging.error(f"RAID3 read failed during parity reconstruction: {e}")
+                return None
+            finally:
+                self.semaphores[parity_disk].release()
+
+        return bytes(result)
+
+    # Metody "pomocnicze" do obsługi w razie potrzeby
     def stop_disks(self):
         """
-        Zatrzymuje wszystkie procesy dysków.
+        Aktualnie nie tworzymy żadnych procesów, więc nic nie zatrzymujemy.
+        Zostawiamy metodę w razie przyszłej rozbudowy.
         """
-        for process in self.disk_processes:
-            process.terminate()
-            process.join()
-
-        logging.info("All disk processes stopped")
+        logging.info("All disk processes would stop here if they existed.")

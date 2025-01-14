@@ -1,17 +1,26 @@
-from PyQt5 import QtWidgets
-from disks.disk import Disk
-from controllers.raid_controller import RAIDController
-from gui.raid_interface import RAIDInterface
-import sys
+#/main.py
 
-if __name__ == "__main__":
-    app = QtWidgets.QApplication(sys.argv)
+import sys
+from PyQt6.QtWidgets import QApplication
+from network.protocol import NetworkProtocol
+from controller.raid_controller import RAIDController
+from gui.raid_interface import RAIDSimulatorGUI
+
+def main():
+    network = NetworkProtocol()
+    network.start_server()
     
-    disks = [Disk(5000 + i, i) for i in range(4)]
-    raid_controller = RAIDController(disks)
-    raid_controller.start_disks()
+    controller = RAIDController('RAID0')
     
-    window = RAIDInterface(raid_controller)
+    app = QApplication(sys.argv)
+    window = RAIDSimulatorGUI(controller)
     window.show()
     
-    sys.exit(app.exec_())
+    try:
+        sys.exit(app.exec())
+    finally:
+        network.stop()
+        controller.stop_disks()
+
+if __name__ == '__main__':
+    main()
